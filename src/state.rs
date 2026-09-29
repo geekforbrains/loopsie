@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub struct State {
@@ -37,23 +37,35 @@ impl State {
         self.root.join(format!("{name}.{suffix}"))
     }
     pub fn lock(&self, name: &str) -> io::Result<File> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.path(name, "lock"))?;
-        file.try_lock().map_err(|err| match err {
-            TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("loop '{name}' is already running"),
-            ),
-            TryLockError::Error(err) => err,
-        })?;
-        // Lock files are persistent: unlinking a lock creates a second lock inode.
-        Ok(file)
+        let path = self.path(name, "lock");
+        loop {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            file.try_lock().map_err(|err| match err {
+                TryLockError::WouldBlock => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("loop '{name}' is already running"),
+                ),
+                TryLockError::Error(err) => err,
+            })?;
+            // Prune unlinks locks while holding them. A lock taken on an
+            // unlinked inode guards nothing, so retry on the current path.
+            let held = file.metadata()?;
+            match fs::symlink_metadata(&path) {
+                Ok(linked) if linked.dev() == held.dev() && linked.ino() == held.ino() => {
+                    return Ok(file);
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
     }
     pub fn is_running(&self, name: &str) -> io::Result<bool> {
         let file = match OpenOptions::new()
@@ -74,6 +86,32 @@ impl State {
     }
     pub fn names(&self) -> io::Result<Vec<String>> {
         names_with_extension(&self.root, "lock")
+    }
+    /// Removes a loop's state and logs unless it is running; returns whether it did.
+    pub fn remove_stopped(&self, name: &str) -> io::Result<bool> {
+        let _lock = match self.lock(name) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        // Names cannot contain dots, so the first dot ends the owner's name.
+        // Legacy PID files are left for the user, as `run` asks.
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            let owned = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(|file| file.split_once('.'))
+                .is_some_and(|(owner, suffix)| {
+                    owner == name && suffix != "lock" && suffix != "pid"
+                });
+            if owned {
+                remove_existing(&path)?;
+            }
+        }
+        // Unlink the lock last, while holding it, so a failure leaves the loop listed.
+        remove_existing(&self.path(name, "lock"))?;
+        Ok(true)
     }
     pub fn write_status(&self, name: &str, status: &str) -> io::Result<()> {
         atomic_write(&self.path(name, "status"), status.as_bytes())
@@ -130,6 +168,13 @@ fn names_with_extension(root: &Path, extension: &str) -> io::Result<Vec<String>>
     }
     names.sort();
     Ok(names)
+}
+
+fn remove_existing(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {

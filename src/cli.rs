@@ -8,6 +8,7 @@ Usage:
   loopsie ls
   loopsie logs [-f|--follow] NAME
   loopsie kill NAME | --all
+  loopsie prune
   loopsie alias set NAME -- COMMAND [ARGS...]
   loopsie alias ls | show NAME | rm NAME
 
@@ -33,6 +34,7 @@ Names: 1–48 ASCII letters, digits, underscores or hyphens; no leading hyphen.
 Commands inherit the working directory and environment; stdin is closed.
 Each loop is an independent background process. Use agent CLIs in print/exec mode.
 State: $LOOPSIE_DIR or ~/.loopsie. Stop with `loopsie kill NAME`.
+Remove every loop that is not running, with its logs, using `loopsie prune`.
 ";
 
 #[derive(Debug)]

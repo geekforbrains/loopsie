@@ -151,9 +151,10 @@ loopsie logs codemonkey    # what did it do?
 loopsie logs -f codemonkey # what is it doing right now?
 loopsie kill codemonkey    # ok that's enough
 loopsie kill --all         # everybody out
+loopsie prune              # sweep up the bodies
 ```
 
-`kill` acknowledges the stop request; `ls` shows `stopped` when cleanup finishes. Foreground loops also clean up on Ctrl-C, TERM, or HUP. Sleep and retry waits are interruptible. You don't have to sit through the rest of a five-minute nap.
+`kill` acknowledges the stop request; `ls` shows `stopped` when cleanup finishes. `prune` deletes the state and logs of every loop that isn't running (`stopped` or `stale` in `ls`) and leaves live loops alone. Foreground loops also clean up on Ctrl-C, TERM, or HUP. Sleep and retry waits are interruptible. You don't have to sit through the rest of a five-minute nap.
 
 ## Full CLI
 
@@ -179,6 +180,7 @@ loopsie run [OPTIONS] -- COMMAND [ARGS...]
 loopsie ls
 loopsie logs [-f|--follow] NAME
 loopsie kill NAME | --all
+loopsie prune
 loopsie alias set NAME -- COMMAND [ARGS...]
 loopsie alias ls | show NAME | rm NAME
 ```
@@ -198,7 +200,7 @@ Foreground finite loops return the last iteration's exit code: `124` for timeout
 - **Sleep means sleep.** Event-driven waits, bounded output buffers, and no growing pile of command output in memory.
 - **State in `~/.loopsie/`.** Locks, sockets, plain text status, and rotating logs. Set `LOOPSIE_DIR` to put them somewhere else, and use the same value for management commands.
 
-Stopped status and logs stick around. `ls` shows the phase, PID, command attempts, consecutive failures, and last exit. Reuse a stopped name by running it again. Leave live state files alone; the lock files stay on disk on purpose.
+Stopped status and logs stick around until `loopsie prune`. `ls` shows the phase, PID, command attempts, consecutive failures, and last exit. Reuse a stopped name by running it again. Leave live state files alone, and use `prune` rather than `rm`: it holds each loop's lock while deleting, so it can't pull state out from under a loop that's starting.
 
 `logs` prints both retained files. `logs -f` follows the current file across rotation until you interrupt it; a slow follower can miss output that's already rotated away. New directories use mode `0700`, files `0600`. Keep custom state paths short: macOS needs the full socket path under 104 bytes.
 

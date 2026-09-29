@@ -550,6 +550,88 @@ fn concurrent_duplicate_names_have_only_one_owner() {
 }
 
 #[test]
+fn prune_removes_only_loops_that_are_not_running() {
+    let fixture = Fixture::new();
+    fixture.ok(&[
+        "run",
+        "--fg",
+        "-n",
+        "done",
+        "-m",
+        "1",
+        "--",
+        "/bin/echo",
+        "first-run",
+    ]);
+    fixture.ok(&[
+        "run",
+        "-n",
+        "live",
+        "--sleep",
+        "30s",
+        "--grace",
+        "50ms",
+        "--",
+        "/bin/echo",
+        "live",
+    ]);
+    fixture.wait_phase("live", "waiting");
+    // A killed supervisor leaves stale state; legacy PID files belong to the user.
+    fs::write(fixture.state.join("crashed.lock"), b"").unwrap();
+    fs::write(
+        fixture.state.join("crashed.status"),
+        "1\trunning\t1\t0\t-\n",
+    )
+    .unwrap();
+    fs::write(fixture.state.join("crashed.log"), b"old\n").unwrap();
+    fs::write(fixture.state.join("crashed.pid"), b"1\n").unwrap();
+
+    let result = fixture.ok(&["prune"]);
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "Removed 'crashed'.\nRemoved 'done'.\n"
+    );
+    let mut files: Vec<_> = fs::read_dir(&fixture.state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|file| !file.starts_with("live."))
+        .collect();
+    files.sort();
+    assert_eq!(files, ["crashed.pid"]);
+    for suffix in ["lock", "log", "sock", "status"] {
+        assert!(fixture.state.join(format!("live.{suffix}")).exists());
+    }
+    let listing = fixture.ok(&["ls"]);
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("live"), "{listing}");
+    assert!(
+        !listing.contains("done") && !listing.contains("crashed"),
+        "{listing}"
+    );
+    assert_eq!(fixture.ok(&["prune"]).stdout, b"No stopped loops.\n");
+
+    fixture.ok(&[
+        "run",
+        "--fg",
+        "-n",
+        "done",
+        "-m",
+        "1",
+        "--",
+        "/bin/echo",
+        "second-run",
+    ]);
+    let log = fixture.log("done");
+    assert!(
+        log.contains("second-run") && !log.contains("first-run"),
+        "{log}"
+    );
+    fixture.assert_finished("done", 1, 0);
+    fixture.ok(&["kill", "live"]);
+    fixture.wait_phase("live", "stopped");
+}
+
+#[test]
 fn aliases_preserve_argument_boundaries_and_support_lifecycle() {
     let fixture = Fixture::new();
     fixture.ok(&[

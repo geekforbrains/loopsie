@@ -99,6 +99,19 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
             }
             Ok(0)
         }
+        "prune" if args.len() == 1 => {
+            let mut removed = 0;
+            for name in state.names()? {
+                if state.remove_stopped(&name)? {
+                    println!("Removed '{name}'.");
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                println!("No stopped loops.");
+            }
+            Ok(0)
+        }
         "logs" => {
             let mut follow = false;
             let mut target = None;
