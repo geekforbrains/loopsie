@@ -2,13 +2,14 @@ use crate::cli::RunConfig;
 use crate::platform::{self, Signals};
 use crate::state::State;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,9 @@ const OUTPUT_CHUNK: usize = 16 * 1024;
 const OUTPUT_BATCH: usize = 16;
 const MAX_CLIENTS: usize = 32;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+const GATE_OUTPUT_LIMIT: usize = 16 * 1024;
+const PROMPT_LIMIT: u64 = 1024 * 1024;
+const RUN_OUTPUT_LIMIT: usize = 64 * 1024;
 
 struct SocketPath(PathBuf);
 
@@ -225,8 +229,8 @@ impl Control {
         Ok(())
     }
 
-    fn poll(&self, output: Option<&UnixStream>, deadline: Option<Instant>) -> io::Result<()> {
-        let mut fds = Vec::with_capacity(3 + self.clients.len());
+    fn poll(&self, outputs: &[&UnixStream], deadline: Option<Instant>) -> io::Result<()> {
+        let mut fds = Vec::with_capacity(2 + outputs.len() + self.clients.len());
         for fd in [self.listener.as_raw_fd(), self.signals.reader.as_raw_fd()] {
             fds.push(libc::pollfd {
                 fd,
@@ -234,7 +238,7 @@ impl Control {
                 revents: 0,
             });
         }
-        if let Some(output) = output {
+        for output in outputs {
             fds.push(libc::pollfd {
                 fd: output.as_raw_fd(),
                 events: libc::POLLIN,
@@ -272,7 +276,7 @@ impl Control {
             if self.stop.is_some() || Instant::now() >= deadline {
                 return Ok(());
             }
-            self.poll(None, Some(deadline))?;
+            self.poll(&[], Some(deadline))?;
         }
     }
 }
@@ -293,12 +297,63 @@ impl Drop for ActiveChild {
     }
 }
 
-fn drain_output(output: &mut UnixStream, log: &mut RotatingLog) -> io::Result<bool> {
+struct Capture {
+    bytes: Vec<u8>,
+    limit: usize,
+    tail: bool,
+    truncated: bool,
+}
+
+impl Capture {
+    fn new(limit: usize, tail: bool) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            tail,
+            truncated: false,
+        }
+    }
+
+    fn add(&mut self, chunk: &[u8]) {
+        if chunk.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.truncated = true;
+        }
+        if self.tail {
+            if chunk.len() >= self.limit {
+                self.bytes.clear();
+                self.bytes
+                    .extend_from_slice(&chunk[chunk.len() - self.limit..]);
+            } else {
+                let overflow = self
+                    .bytes
+                    .len()
+                    .saturating_add(chunk.len())
+                    .saturating_sub(self.limit);
+                self.bytes.drain(..overflow);
+                self.bytes.extend_from_slice(chunk);
+            }
+        } else {
+            let count = chunk.len().min(self.limit.saturating_sub(self.bytes.len()));
+            self.bytes.extend_from_slice(&chunk[..count]);
+        }
+    }
+}
+
+fn drain_output(
+    output: &mut UnixStream,
+    log: &mut RotatingLog,
+    mut capture: Option<&mut Capture>,
+) -> io::Result<bool> {
     let mut buffer = [0_u8; OUTPUT_CHUNK];
     for _ in 0..OUTPUT_BATCH {
         match output.read(&mut buffer) {
             Ok(0) => return Ok(true),
-            Ok(count) => log.write(&buffer[..count])?,
+            Ok(count) => {
+                log.write(&buffer[..count])?;
+                if let Some(capture) = capture.as_mut() {
+                    capture.add(&buffer[..count]);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -307,26 +362,45 @@ fn drain_output(output: &mut UnixStream, log: &mut RotatingLog) -> io::Result<bo
     Ok(false)
 }
 
-fn spawn(config: &RunConfig, iteration: u64) -> io::Result<(ActiveChild, UnixStream)> {
+fn spawn_stage(
+    executable: &OsStr,
+    args: &[OsString],
+    config: &RunConfig,
+    iteration: u64,
+    env: &[(&str, &str)],
+    stdin: Option<File>,
+    split_stderr: bool,
+) -> io::Result<(ActiveChild, Vec<UnixStream>)> {
     let (reader, writer) = UnixStream::pair()?;
     reader.set_nonblocking(true)?;
-    let stderr = writer.try_clone()?;
-    let mut command = Command::new(&config.command[0]);
+    let (stderr, extra_reader) = if split_stderr {
+        let (extra_reader, extra_writer) = UnixStream::pair()?;
+        extra_reader.set_nonblocking(true)?;
+        (extra_writer, Some(extra_reader))
+    } else {
+        (writer.try_clone()?, None)
+    };
+    let mut command = Command::new(executable);
     command
-        .args(&config.command[1..])
+        .args(args)
         .env("LOOPSIE_NAME", &config.name)
         .env("LOOPSIE_ITERATION", iteration.to_string())
-        .stdin(Stdio::null())
+        .envs(env.iter().copied())
+        .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::from(OwnedFd::from(writer)))
         .stderr(Stdio::from(OwnedFd::from(stderr)))
         .process_group(0);
     let child = command.spawn()?;
+    let mut outputs = vec![reader];
+    if let Some(extra_reader) = extra_reader {
+        outputs.push(extra_reader);
+    }
     Ok((
         ActiveChild {
             child,
             reaped: false,
         },
-        reader,
+        outputs,
     ))
 }
 
@@ -345,25 +419,31 @@ fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 
 fn supervise(
     mut child: ActiveChild,
-    mut output: UnixStream,
+    mut outputs: Vec<UnixStream>,
     config: &RunConfig,
     control: &mut Control,
     log: &mut RotatingLog,
-    started: Instant,
+    timeout: Option<Instant>,
+    mut capture: Option<&mut Capture>,
 ) -> io::Result<i32> {
-    let timeout = if config.timeout.is_zero() {
-        None
-    } else {
-        started.checked_add(config.timeout)
-    };
     let mut termination = None;
     let mut forced_exit = None;
     let mut killed = false;
-    let mut eof = false;
+    let mut eof = vec![false; outputs.len()];
     loop {
         control.service()?;
-        if !eof {
-            eof = drain_output(&mut output, log)?;
+        for (index, output) in outputs.iter_mut().enumerate() {
+            if !eof[index] {
+                eof[index] = drain_output(
+                    output,
+                    log,
+                    if index == 0 {
+                        capture.as_deref_mut()
+                    } else {
+                        None
+                    },
+                )?;
+            }
         }
         let exited = platform::child_exited(child.child.id())?;
         let now = Instant::now();
@@ -383,7 +463,10 @@ fn supervise(
         // EOF and an exited leader mean normal commands need no grace delay.
         // Kill any descendants which closed their output before reaping the
         // leader; retained PID ownership makes the group signal safe.
-        if !killed && termination.is_some_and(|deadline| now >= deadline || (exited && eof)) {
+        if !killed
+            && termination
+                .is_some_and(|deadline| now >= deadline || (exited && eof.iter().all(|v| *v)))
+        {
             platform::signal_group(child.child.id(), libc::SIGKILL, exited)?;
             killed = true;
         }
@@ -391,7 +474,10 @@ fn supervise(
             // Snapshot the queued bytes so large socket buffers are drained
             // completely, while an escaped descendant cannot prolong cleanup
             // forever by retaining the descriptor or continuously writing.
-            if !eof {
+            for (index, output) in outputs.iter_mut().enumerate() {
+                if eof[index] {
+                    continue;
+                }
                 let mut remaining = platform::pending_output(output.as_raw_fd())?;
                 let mut buffer = [0_u8; OUTPUT_CHUNK];
                 while remaining > 0 {
@@ -401,6 +487,11 @@ fn supervise(
                         Ok(0) => break,
                         Ok(count) => {
                             log.write(&buffer[..count])?;
+                            if index == 0
+                                && let Some(capture) = capture.as_deref_mut()
+                            {
+                                capture.add(&buffer[..count]);
+                            }
                             remaining -= count;
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -420,7 +511,12 @@ fn supervise(
         } else {
             timeout
         };
-        control.poll(if eof { None } else { Some(&output) }, deadline)?;
+        let active: Vec<_> = outputs
+            .iter()
+            .zip(&eof)
+            .filter_map(|(output, done)| (!done).then_some(output))
+            .collect();
+        control.poll(&active, deadline)?;
     }
 }
 
@@ -438,6 +534,147 @@ fn failure_delay(base: Duration, maximum: Duration, failures: u64) -> Duration {
     delay
 }
 
+struct Stage<'a> {
+    executable: &'a OsStr,
+    args: &'a [OsString],
+    iteration: u64,
+    env: &'a [(&'a str, &'a str)],
+    stdin: Option<File>,
+    split_stderr: bool,
+    timeout: Duration,
+    capture: Option<&'a mut Capture>,
+    label: &'a str,
+}
+
+fn execute(
+    stage: Stage<'_>,
+    config: &RunConfig,
+    control: &mut Control,
+    log: &mut RotatingLog,
+) -> io::Result<(i32, bool)> {
+    let started = Instant::now();
+    match spawn_stage(
+        stage.executable,
+        stage.args,
+        config,
+        stage.iteration,
+        stage.env,
+        stage.stdin,
+        stage.split_stderr,
+    ) {
+        Ok((child, outputs)) => Ok((
+            supervise(
+                child,
+                outputs,
+                config,
+                control,
+                log,
+                if stage.timeout.is_zero() {
+                    None
+                } else {
+                    started.checked_add(stage.timeout)
+                },
+                stage.capture,
+            )?,
+            true,
+        )),
+        Err(error) => {
+            log.event(format_args!("cannot start {}: {error}", stage.label))?;
+            Ok((127, false))
+        }
+    }
+}
+
+fn prompt_stdin(
+    config: &RunConfig,
+    state: &State,
+    iteration: u64,
+    gate_output: &str,
+) -> io::Result<Option<File>> {
+    let Some(path) = &config.prompt_file else {
+        return Ok(None);
+    };
+    let mut content = Vec::new();
+    File::open(Path::new(path))?
+        .take(PROMPT_LIMIT + 1)
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > PROMPT_LIMIT {
+        return Err(io::Error::other("prompt file exceeds 1 MiB"));
+    }
+    let text =
+        String::from_utf8(content).map_err(|_| io::Error::other("prompt file must be UTF-8"))?;
+    let rendered = text.replace("${LOOPSIE_GATE_OUTPUT}", gate_output);
+    if rendered.len() as u64 > PROMPT_LIMIT {
+        return Err(io::Error::other("rendered prompt exceeds 1 MiB"));
+    }
+    let temp = state.path(
+        &config.name,
+        &format!("prompt-{}-{iteration}", std::process::id()),
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    fs::remove_file(&temp)?;
+    file.write_all(rendered.as_bytes())?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(Some(file))
+}
+
+struct RunOutputFile(PathBuf);
+
+impl RunOutputFile {
+    fn new(state: &State, name: &str, capture: &Capture) -> io::Result<Self> {
+        let path = state.path(name, "run-output");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(&capture.bytes)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RunOutputFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn wait_next(
+    config: &RunConfig,
+    control: &mut Control,
+    log: &mut RotatingLog,
+    status: &mut Status<'_>,
+    started: Instant,
+) -> io::Result<()> {
+    status.write("waiting")?;
+    let completed = Instant::now();
+    let delay = config.sleep.max(failure_delay(
+        config.backoff,
+        config.max_backoff,
+        status.failures,
+    ));
+    let mut next = completed.checked_add(delay).unwrap_or(completed);
+    if let Some(every) = config.every {
+        next = next.max(started.checked_add(every).unwrap_or(started));
+    }
+    if status.failures > 0 {
+        log.event(format_args!(
+            "{} consecutive failures; retry in {}ms",
+            status.failures,
+            next.saturating_duration_since(completed).as_millis()
+        ))?;
+    }
+    control.wait_until(next)
+}
+
 fn run_loop(
     config: &RunConfig,
     control: &mut Control,
@@ -449,17 +686,123 @@ fn run_loop(
         if let Some(code) = control.stop {
             return Ok(code);
         }
-        status.iteration = status.iteration.saturating_add(1);
-        status.write("running")?;
-        log.event(format_args!("iteration {} started", status.iteration))?;
         let started = Instant::now();
-        let code = match spawn(config, status.iteration) {
-            Ok((child, output)) => supervise(child, output, config, control, log, started)?,
+        let mut gate_output = String::new();
+        if let Some(gate) = &config.gate {
+            status.write("gating")?;
+            let mut capture = Capture::new(GATE_OUTPUT_LIMIT, false);
+            let (gate_code, _) = execute(
+                Stage {
+                    executable: gate,
+                    args: &[],
+                    iteration: status.iteration.saturating_add(1),
+                    env: &[],
+                    stdin: None,
+                    split_stderr: true,
+                    timeout: config.hook_timeout,
+                    capture: Some(&mut capture),
+                    label: "gate",
+                },
+                config,
+                control,
+                log,
+            )?;
+            if let Some(code) = control.stop {
+                return Ok(code);
+            }
+            if gate_code == 1 {
+                log.event(format_args!("gate skipped command"))?;
+                status.failures = 0;
+                wait_next(config, control, log, status, started)?;
+                continue;
+            }
+            let invalid = capture.truncated
+                || capture.bytes.contains(&0)
+                || String::from_utf8(capture.bytes.clone()).is_err();
+            if gate_code != 0 || invalid {
+                let code = if gate_code == 0 { 125 } else { gate_code };
+                if invalid && gate_code == 0 {
+                    log.event(format_args!(
+                        "gate output must be UTF-8, contain no NUL, and fit in 16 KiB"
+                    ))?;
+                }
+                log.event(format_args!("gate failed with exit {code}"))?;
+                status.exit = Some(code);
+                status.failures = status.failures.saturating_add(1);
+                wait_next(config, control, log, status, started)?;
+                continue;
+            }
+            gate_output = String::from_utf8(capture.bytes).unwrap();
+            gate_output = gate_output.trim_end_matches(['\n', '\r']).to_owned();
+        }
+        let iteration = status.iteration.saturating_add(1);
+        let stdin = match prompt_stdin(config, status.state, iteration, &gate_output) {
+            Ok(stdin) => stdin,
             Err(error) => {
-                log.event(format_args!("cannot start command: {error}"))?;
-                127
+                log.event(format_args!("cannot load prompt file: {error}"))?;
+                status.exit = Some(125);
+                status.failures = status.failures.saturating_add(1);
+                wait_next(config, control, log, status, started)?;
+                continue;
             }
         };
+        status.iteration = iteration;
+        status.write("running")?;
+        log.event(format_args!("iteration {} started", status.iteration))?;
+        let mut capture = Capture::new(RUN_OUTPUT_LIMIT, true);
+        let (command_code, launched) = execute(
+            Stage {
+                executable: &config.command[0],
+                args: &config.command[1..],
+                iteration,
+                env: &[("LOOPSIE_GATE_OUTPUT", &gate_output)],
+                stdin,
+                split_stderr: false,
+                timeout: config.timeout,
+                capture: config.postrun.as_ref().map(|_| &mut capture),
+                label: "command",
+            },
+            config,
+            control,
+            log,
+        )?;
+        let mut code = command_code;
+        if launched
+            && control.stop.is_none()
+            && let Some(postrun) = &config.postrun
+        {
+            let output_file = RunOutputFile::new(status.state, &config.name, &capture)?;
+            let path = output_file.0.to_string_lossy().into_owned();
+            let exit = command_code.to_string();
+            let truncated = if capture.truncated { "1" } else { "0" };
+            status.write("postrun")?;
+            log.event(format_args!("postrun started for iteration {iteration}"))?;
+            let (post_code, _) = execute(
+                Stage {
+                    executable: postrun,
+                    args: &[],
+                    iteration,
+                    env: &[
+                        ("LOOPSIE_GATE_OUTPUT", &gate_output),
+                        ("LOOPSIE_EXIT_CODE", &exit),
+                        ("LOOPSIE_RUN_OUTPUT_FILE", &path),
+                        ("LOOPSIE_RUN_OUTPUT_TRUNCATED", truncated),
+                    ],
+                    stdin: None,
+                    split_stderr: false,
+                    timeout: config.hook_timeout,
+                    capture: None,
+                    label: "postrun",
+                },
+                config,
+                control,
+                log,
+            )?;
+            log.event(format_args!("postrun exited {post_code}"))?;
+            if command_code == 0 && post_code != 0 {
+                code = post_code;
+            }
+        }
         status.exit = Some(code);
         log.event(format_args!(
             "iteration {} exited {code} after {}ms",
@@ -474,25 +817,7 @@ fn run_loop(
         if control.stop.is_some() || (config.max != 0 && status.iteration >= config.max) {
             return Ok(control.stop.unwrap_or(code));
         }
-        status.write("waiting")?;
-        let completed = Instant::now();
-        let delay = config.sleep.max(failure_delay(
-            config.backoff,
-            config.max_backoff,
-            status.failures,
-        ));
-        let mut next = completed.checked_add(delay).unwrap_or(completed);
-        if let Some(every) = config.every {
-            next = next.max(started.checked_add(every).unwrap_or(started));
-        }
-        if status.failures > 0 {
-            log.event(format_args!(
-                "{} consecutive failures; retry in {}ms",
-                status.failures,
-                next.saturating_duration_since(completed).as_millis()
-            ))?;
-        }
-        control.wait_until(next)?;
+        wait_next(config, control, log, status, started)?;
     }
 }
 

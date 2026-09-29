@@ -56,9 +56,49 @@ loopsie run --sleep 5m --name codexmonkey --timeout 30m -- \
 
 Set it. Forget it. Go touch grass, or your... nvm.
 
-Use `claude -p`, `codex exec`, or your CLI's equivalent batch mode. Commands get closed stdin, so an interactive agent waiting for you to press Enter is going to have a bad time. Your agents keep their usual permissions and authentication.
+Use `claude -p`, `codex exec`, or your CLI's equivalent batch mode. Commands get closed stdin unless you provide `--prompt-file`, so an interactive agent waiting for you to press Enter is going to have a bad time. Your agents keep their usual permissions and authentication.
 
 Each run starts a fresh command in the directory where you launched the loop, with your environment. Want to resume an agent session? Pass that CLI's resume options. Running several agents in the same repo is still several agents editing the same repo. Choose your chaos.
+
+## Gates and prompt files
+
+Keep an agent asleep until there is work. A gate is an executable checked before each run. Exit **0** to run the command, **1** to skip it, or anything else to report a gate failure. Gate stdout becomes `LOOPSIE_GATE_OUTPUT` after trailing newlines are removed; stderr goes to the loop log. Gate output must be UTF-8, contain no NUL byte, and fit in **16 KiB**.
+
+```sh
+# pick-issue.sh
+#!/bin/sh
+issue=$(gh issue list --state open --label ready --json number --jq '.[0].number // empty') || exit 2
+[ -n "$issue" ] || exit 1
+printf '%s\n' "$issue"
+```
+
+```md
+<!-- prompt.md -->
+Work on GitHub issue #${LOOPSIE_GATE_OUTPUT}.
+Read the issue, make the change, and report what you did.
+```
+
+```sh
+# after-task.sh
+#!/bin/sh
+printf 'issue %s finished with exit %s\n' "$LOOPSIE_GATE_OUTPUT" "$LOOPSIE_EXIT_CODE"
+tail -n 10 "$LOOPSIE_RUN_OUTPUT_FILE"
+```
+
+```sh
+chmod +x pick-issue.sh after-task.sh
+
+loopsie run --every 5m --name issue-worker --gate ./pick-issue.sh \
+  --prompt-file prompt.md --postrun ./after-task.sh -- claude -p
+
+# Same input flow with Codex
+loopsie run --every 5m --name codex-issues --gate ./pick-issue.sh \
+  --prompt-file prompt.md --postrun ./after-task.sh -- codex exec -
+```
+
+Loopsie reads and renders the UTF-8 prompt file on every passing check, replaces only `${LOOPSIE_GATE_OUTPUT}`, and sends the result to the command's stdin. Without `--prompt-file`, stdin remains closed. A skipped gate does not launch the command or count toward `--max`. With a gate, `--every` measures between gate checks; `--sleep` waits after each check or completed run. Gate failures use the usual retry backoff.
+
+Postrun runs after a command that started, even if it exits nonzero or times out. The executable receives `LOOPSIE_EXIT_CODE`, `LOOPSIE_GATE_OUTPUT`, and `LOOPSIE_RUN_OUTPUT_FILE`. That file contains the last **64 KiB** of combined command stdout and stderr and exists only while postrun runs. `LOOPSIE_RUN_OUTPUT_TRUNCATED=1` means earlier output was omitted. A failed postrun is logged and makes an otherwise successful iteration fail; it does not separately replay the command. Stop requests skip postrun so shutdown stays prompt. Gate and postrun have a **30s** timeout by default, adjustable with `--hook-timeout`.
 
 ## When shit goes sideways
 
@@ -110,6 +150,10 @@ loopsie run [OPTIONS] -- COMMAND [ARGS...]
   -s, --sleep DURATION     Delay after completion (default: 0)
   -m, --max N              Stop after N attempts (default: 0 = forever)
       --alias NAME         Use a saved alias as command prefix
+      --gate FILE          Run executable before each check (0=run, 1=skip)
+      --prompt-file FILE   Render file and send it to command stdin
+      --postrun FILE       Run executable after each command attempt
+      --hook-timeout DUR   Limit gate and postrun (default: 30s)
       --fg                 Stay in foreground; output still goes to logs
       --timeout DURATION   Limit each attempt (default: 1h; 0 disables)
       --grace DURATION     Time before force kill (default: 5s)
@@ -128,9 +172,9 @@ Durations: `100ms`, `30s`, `5m`, `2h`, `1h30m` — you get it. Whole numbers onl
 
 Pick `--every` or `--sleep`, not both. One loop never overlaps its own commands or tries to catch up on missed runs. After a failure, both the schedule and retry delay apply. Without a schedule, successful commands restart immediately. Maybe give the paid API a breather.
 
-`--max` counts failed attempts too, and there's no pointless sleep after the last one. Commands receive `LOOPSIE_NAME` and `LOOPSIE_ITERATION`, starting at 1.
+`--max` counts failed command attempts too, but not skipped gate checks, and there's no pointless sleep after the last one. Commands receive `LOOPSIE_NAME` and `LOOPSIE_ITERATION`, starting at 1.
 
-Foreground finite loops return the last command's exit code: `124` for timeout, `127` for failure to start, or `128 + signal` for signal termination. `loopsie kill` makes the supervisor exit `0`; directly signalling it returns `128 + signal`. Background startup returns once the loop is ready; check `ls` and logs for what happens next.
+Foreground finite loops return the last iteration's exit code: `124` for timeout, `127` for failure to start, or `128 + signal` for signal termination. A failed postrun overrides a successful command's exit code. `loopsie kill` makes the supervisor exit `0`; directly signalling it returns `128 + signal`. Background startup returns once the loop is ready; check `ls` and logs for what happens next.
 
 ## Design philosophy
 
@@ -139,7 +183,7 @@ Foreground finite loops return the last command's exit code: `124` for timeout, 
 - **Sleep means sleep.** Event-driven waits, bounded output buffers, and no growing pile of command output in memory.
 - **State in `~/.loopsie/`.** Locks, sockets, plain text status, and rotating logs. Set `LOOPSIE_DIR` to put them somewhere else, and use the same value for management commands.
 
-Stopped status and logs stick around. `ls` shows the phase, PID, attempts, consecutive failures, and last exit. Reuse a stopped name by running it again. Leave live state files alone; the lock files stay on disk on purpose.
+Stopped status and logs stick around. `ls` shows the phase, PID, command attempts, consecutive failures, and last exit. Reuse a stopped name by running it again. Leave live state files alone; the lock files stay on disk on purpose.
 
 `logs` prints both retained files. `logs -f` follows the current file across rotation until you interrupt it; a slow follower can miss output that's already rotated away. New directories use mode `0700`, files `0600`. Keep custom state paths short: macOS needs the full socket path under 104 bytes.
 

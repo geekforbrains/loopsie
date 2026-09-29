@@ -17,6 +17,10 @@ Run options:
   -s, --sleep DURATION     Delay after each completion (default: 0)
   -m, --max N              Number of attempts (default: 0, forever)
       --alias NAME         Prepend a saved command
+      --gate FILE          Run executable before each attempt (0=run, 1=skip)
+      --prompt-file FILE   Render file and send it to command stdin
+      --postrun FILE       Run executable after each command attempt
+      --hook-timeout DUR   Limit gate and postrun (default: 30s)
       --fg                 Stay in foreground; output still goes to logs
       --timeout DURATION   Limit each attempt (default: 1h; 0 disables)
       --grace DURATION     Allow termination before force kill (default: 5s)
@@ -35,6 +39,10 @@ State: $LOOPSIE_DIR or ~/.loopsie. Stop with `loopsie kill NAME`.
 pub struct RunConfig {
     pub name: String,
     pub command: Vec<OsString>,
+    pub gate: Option<OsString>,
+    pub prompt_file: Option<OsString>,
+    pub postrun: Option<OsString>,
+    pub hook_timeout: Duration,
     pub every: Option<Duration>,
     pub sleep: Duration,
     pub max: u64,
@@ -115,6 +123,10 @@ pub fn parse_run(args: &[OsString]) -> Result<(RunConfig, Option<String>), Strin
                 .as_nanos()
         ),
         command: Vec::new(),
+        gate: None,
+        prompt_file: None,
+        postrun: None,
+        hook_timeout: Duration::from_secs(30),
         every: None,
         sleep: Duration::ZERO,
         max: 0,
@@ -149,6 +161,10 @@ pub fn parse_run(args: &[OsString]) -> Result<(RunConfig, Option<String>), Strin
                 | "-m"
                 | "--max"
                 | "--alias"
+                | "--gate"
+                | "--prompt-file"
+                | "--postrun"
+                | "--hook-timeout"
                 | "--timeout"
                 | "--grace"
                 | "--backoff"
@@ -181,6 +197,10 @@ pub fn parse_run(args: &[OsString]) -> Result<(RunConfig, Option<String>), Strin
                 valid_name(value)?;
                 alias = Some(value.into());
             }
+            "--gate" => cfg.gate = Some(value.into()),
+            "--prompt-file" => cfg.prompt_file = Some(value.into()),
+            "--postrun" => cfg.postrun = Some(value.into()),
+            "--hook-timeout" => cfg.hook_timeout = duration(value)?,
             "--timeout" => cfg.timeout = duration(value)?,
             "--grace" => cfg.grace = duration(value)?,
             "--backoff" => cfg.backoff = duration(value)?,
@@ -204,6 +224,15 @@ pub fn parse_run(args: &[OsString]) -> Result<(RunConfig, Option<String>), Strin
     if cfg.log_bytes < 4096 {
         return Err("--log-bytes must be at least 4096".into());
     }
+    if cfg.hook_timeout.is_zero() {
+        return Err("--hook-timeout must be positive".into());
+    }
+    if cfg.gate.as_ref().is_some_and(|v| v.is_empty())
+        || cfg.prompt_file.as_ref().is_some_and(|v| v.is_empty())
+        || cfg.postrun.as_ref().is_some_and(|v| v.is_empty())
+    {
+        return Err("hook and prompt paths must not be empty".into());
+    }
     if cfg.command.is_empty() && alias.is_none() {
         return Err("no command specified; use -- COMMAND or --alias NAME".into());
     }
@@ -220,6 +249,7 @@ impl RunConfig {
             ("--grace", self.grace),
             ("--backoff", self.backoff),
             ("--max-backoff", self.max_backoff),
+            ("--hook-timeout", self.hook_timeout),
         ] {
             if flag == "--sleep" && self.every.is_some() {
                 continue;
@@ -228,6 +258,15 @@ impl RunConfig {
         }
         if let Some(every) = self.every {
             args.extend(["--every".into(), format!("{}ms", every.as_millis()).into()]);
+        }
+        for (flag, path) in [
+            ("--gate", &self.gate),
+            ("--prompt-file", &self.prompt_file),
+            ("--postrun", &self.postrun),
+        ] {
+            if let Some(path) = path {
+                args.extend([flag.into(), path.clone()]);
+            }
         }
         args.extend([
             "--max".into(),

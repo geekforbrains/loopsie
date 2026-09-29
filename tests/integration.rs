@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -52,6 +53,12 @@ impl Fixture {
 
     fn log(&self, name: &str) -> String {
         fs::read_to_string(self.state.join(format!("{name}.log"))).unwrap()
+    }
+
+    fn script(&self, name: &str, contents: &str) {
+        let path = self.root.join(name);
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn status(&self, name: &str) -> Option<Vec<String>> {
@@ -680,6 +687,211 @@ fn foreground_commands_receive_closed_stdin() {
             .count(),
         2
     );
+}
+
+#[test]
+fn gate_skip_then_prompt_and_postrun_share_one_attempt() {
+    let fixture = Fixture::new();
+    fixture.script(
+        "gate.sh",
+        "#!/bin/sh\nn=$(cat gate-count 2>/dev/null || printf 0)\nn=$((n + 1))\nprintf '%s' \"$n\" > gate-count\nif [ \"$n\" -lt 3 ]; then exit 1; fi\nprintf 'gate-warning\\n' >&2\nprintf 'issue-42\\n'\n",
+    );
+    fixture.script(
+        "postrun.sh",
+        "#!/bin/sh\nset -eu\n[ \"$LOOPSIE_GATE_OUTPUT\" = issue-42 ]\n[ \"$LOOPSIE_EXIT_CODE\" = 7 ]\n[ \"$LOOPSIE_RUN_OUTPUT_TRUNCATED\" = 0 ]\ngrep -Fq 'main-result' \"$LOOPSIE_RUN_OUTPUT_FILE\"\nprintf 'postrun-ok' > postrun-receipt\n",
+    );
+    fs::write(
+        fixture.root.join("prompt.md"),
+        "Work on ${LOOPSIE_GATE_OUTPUT}.\n",
+    )
+    .unwrap();
+    let result = fixture.run(&[
+        "run",
+        "--fg",
+        "-n",
+        "gated",
+        "-m",
+        "1",
+        "--every",
+        "10ms",
+        "--gate",
+        "./gate.sh",
+        "--prompt-file",
+        "prompt.md",
+        "--postrun",
+        "./postrun.sh",
+        "--",
+        "/bin/sh",
+        "-c",
+        "cat > received-prompt; printf 'main-result\\n'; exit 7",
+    ]);
+    assert_eq!(result.status.code(), Some(7));
+    fixture.assert_finished("gated", 1, 7);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("gate-count")).unwrap(),
+        "3"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("received-prompt")).unwrap(),
+        "Work on issue-42.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("postrun-receipt")).unwrap(),
+        "postrun-ok"
+    );
+    assert!(!fixture.state.join("gated.run-output").exists());
+    assert!(fixture.log("gated").contains("gate-warning"));
+    assert_eq!(
+        fixture.log("gated").matches("gate skipped command").count(),
+        2
+    );
+}
+
+#[test]
+fn postrun_failure_is_reported_without_replaying_the_command() {
+    let fixture = Fixture::new();
+    fixture.script("postrun.sh", "#!/bin/sh\nexit 9\n");
+    let result = fixture.run(&[
+        "run",
+        "--fg",
+        "-n",
+        "post-fail",
+        "-m",
+        "1",
+        "--postrun",
+        "./postrun.sh",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf x >> runs",
+    ]);
+    assert_eq!(result.status.code(), Some(9));
+    fixture.assert_finished("post-fail", 1, 9);
+    assert_eq!(fs::read_to_string(fixture.root.join("runs")).unwrap(), "x");
+    assert!(fixture.log("post-fail").contains("postrun exited 9"));
+}
+
+#[test]
+fn prompt_file_is_read_again_for_each_command() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("prompt.md"), "first\n").unwrap();
+    fixture.ok(&[
+        "run",
+        "--fg",
+        "-n",
+        "reread",
+        "-m",
+        "2",
+        "--prompt-file",
+        "prompt.md",
+        "--",
+        "/bin/sh",
+        "-c",
+        "cat; if [ \"$LOOPSIE_ITERATION\" = 1 ]; then printf 'second\\n' > prompt.md; fi",
+    ]);
+    fixture.assert_finished("reread", 2, 0);
+    let log = fixture.log("reread");
+    assert!(log.contains("\nfirst\n"), "{log}");
+    assert!(log.contains("\nsecond\n"), "{log}");
+}
+
+#[test]
+fn background_worker_receives_gate_prompt_and_postrun_options() {
+    let fixture = Fixture::new();
+    fixture.script("gate.sh", "#!/bin/sh\nprintf 'job-91\\n'\n");
+    fixture.script(
+        "postrun.sh",
+        "#!/bin/sh\nset -eu\n[ \"$LOOPSIE_GATE_OUTPUT\" = job-91 ]\ngrep -Fq 'handled:job-91' \"$LOOPSIE_RUN_OUTPUT_FILE\"\necho done > receipt\n",
+    );
+    fs::write(
+        fixture.root.join("prompt.md"),
+        "handled:${LOOPSIE_GATE_OUTPUT}\n",
+    )
+    .unwrap();
+    fixture.ok(&[
+        "run",
+        "-n",
+        "background-hooks",
+        "-m",
+        "1",
+        "--gate",
+        "./gate.sh",
+        "--prompt-file",
+        "prompt.md",
+        "--postrun",
+        "./postrun.sh",
+        "--",
+        "/bin/cat",
+    ]);
+    fixture.assert_finished("background-hooks", 1, 0);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("receipt"))
+            .unwrap()
+            .trim(),
+        "done"
+    );
+}
+
+#[test]
+fn postrun_receives_bounded_output_tail() {
+    let fixture = Fixture::new();
+    fixture.script(
+        "postrun.sh",
+        "#!/bin/sh\nset -eu\n[ \"$LOOPSIE_RUN_OUTPUT_TRUNCATED\" = 1 ]\n[ \"$(wc -c < \"$LOOPSIE_RUN_OUTPUT_FILE\")\" -eq 65536 ]\ngrep -Fq FINAL_TOKEN \"$LOOPSIE_RUN_OUTPUT_FILE\"\n",
+    );
+    fixture.ok(&[
+        "run",
+        "--fg",
+        "-n",
+        "tail",
+        "-m",
+        "1",
+        "--postrun",
+        "./postrun.sh",
+        "--",
+        "/bin/sh",
+        "-c",
+        "yes x | head -c 70000; printf 'FINAL_TOKEN\\n'",
+    ]);
+    fixture.assert_finished("tail", 1, 0);
+}
+
+#[test]
+fn timed_out_gate_is_cleaned_up_and_does_not_launch_the_command() {
+    let fixture = Fixture::new();
+    fixture.script("gate.sh", "#!/bin/sh\necho $$ > pid-gate\nsleep 30\n");
+    fixture.ok(&[
+        "run",
+        "-n",
+        "gate-timeout",
+        "--every",
+        "1s",
+        "--gate",
+        "./gate.sh",
+        "--hook-timeout",
+        "100ms",
+        "--grace",
+        "50ms",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo launched > launched",
+    ]);
+    wait_until(Duration::from_secs(5), || {
+        fixture
+            .log("gate-timeout")
+            .contains("gate failed with exit 124")
+    });
+    fixture.ok(&["kill", "gate-timeout"]);
+    fixture.wait_phase("gate-timeout", "stopped");
+    assert_eq!(fixture.status("gate-timeout").unwrap()[2], "0");
+    assert!(!fixture.root.join("launched").exists());
+    wait_until(Duration::from_secs(5), || {
+        fs::read_to_string(fixture.root.join("pid-gate"))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .is_none_or(|pid| !process_alive(pid))
+    });
 }
 
 #[test]
