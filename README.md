@@ -1,154 +1,155 @@
+<div align="center">
+
 # loopsie
 
-Run a command repeatedly. Keep it running when the command fails.
+**Make a loop, grab a beer** 🍻
 
-A small native Rust binary for macOS and Linux. Each loop has its own process,
-name, logs, and controls. There is no central daemon or built-in instance limit.
-One dependency (`libc`), one supervisor thread per loop, bounded output buffers,
-and event-driven waits that sleep until there is work to do.
+[![Rust](https://img.shields.io/badge/rust-1.98.1-orange.svg)](https://www.rust-lang.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-just_libc-brightgreen.svg)](Cargo.toml)
+
+</div>
+
+---
+
+You've got a command. You want it to run over and over. Maybe with a delay, maybe not. You don't want to write a bash `while` loop like an animal. You want to name it, background it, and forget about it.
+
+That's it. That's the tool.
+
+Now it's Rust. One small binary for macOS and Linux, one dependency, and some actual seatbelts for when your command shits itself.
 
 ## Install
 
-Install [Rust](https://rustup.rs/), then build from this checkout:
+Grab [Rust](https://rustup.rs/), then run this from the checkout:
 
 ```sh
 cargo install --path . --locked
 loopsie --version
 ```
 
-This installs into `~/.cargo/bin`; make sure it is on `PATH`. To install into
-`~/.local/bin` instead, use `cargo install --path . --locked --root ~/.local`.
-The project pins Rust **1.98.1**, edition **2024**.
+The checkout pins Rust **1.98.1**, edition **2024**. Put `~/.cargo/bin` on your `PATH`. Prefer `~/.local/bin`? Add `--root ~/.local` to the install command.
 
 ## Quick start
 
 ```sh
-# Run forever, with a five-minute pause after each invocation
-loopsie run --name review --sleep 5m -- \
-  codex exec "Review this repository and report the next useful improvement."
+# Run a command every 5 minutes
+loopsie run --every 5m -- curl -fsS https://example.com/health
 
-# A separate Claude loop in this working directory
-loopsie run --name claude-review --sleep 5m --timeout 30m -- \
-  claude -p "Review this repository and report the next useful improvement."
+# Give it a 30s breather between runs
+loopsie run --sleep 30s -- ./check-things.sh
 
-# Any executable works
-loopsie run --name status --every 30s -- git status --short
-
-loopsie ls
-loopsie logs review
-loopsie logs -f review
-loopsie kill review
-loopsie kill --all
+# Run successful commands in a tight loop and say fuck it (yolo)
+loopsie run -- echo "are we there yet"
 ```
 
-`run` starts in the background and acknowledges startup only after the instance
-is ready. It inherits your current directory and environment. Arguments after
-`--` are passed directly to the executable, including spaces and empty arguments.
-Use `sh -c '...'` explicitly for pipes, shell builtins, or redirection.
+Loops run in the background by default. Each one gets its own process. Start as many as your machine can stomach.
 
-Commands receive closed stdin. Use `codex exec`, `claude -p`, or equivalent batch
-modes; interactive terminal sessions are not supported. Loopsie keeps the agent's
-existing permissions and authentication. Each invocation starts a fresh command;
-session continuation is controlled by the CLI arguments you supply.
+## The *real* reason you're here 🤖
 
-## Recovery and limits
+```sh
+loopsie run --sleep 5m --name codemonkey -- \
+  claude -p "Check the repo for open TODOs and fix one. When none are left, run: loopsie kill codemonkey"
 
-- Nonzero exits, signals, spawn failures, and timeouts trigger another attempt.
-  Failure delays start at **1 second**, double up to **60 seconds**, and reset
-  after a successful invocation.
-- Every invocation has a **1-hour timeout** by default. Set `--timeout 30m` to
-  change it, or `--timeout 0` to allow an invocation to run indefinitely.
-- Stop and timeout requests send `SIGTERM` to the command's process group,
-  then `SIGKILL` after **5 seconds**. `--grace` changes this upper bound.
-  Once the leader exits and output closes, remaining group members are killed
-  immediately. Cleanup completes before the next invocation starts.
-- Logs rotate while the command runs. Each name retains a current log and one
-  archive, **5 MiB each** by default. Supervisor memory does not grow with output.
-- Instance names are protected by kernel file locks. Control uses a Unix socket;
-  stale PID records cannot signal unrelated processes. Other names run independently.
-- `SIGINT`, `SIGTERM`, and `SIGHUP` stop the supervisor and clean up its command.
-  Sleep and retry waits can be interrupted immediately.
+# Codex can have a job too
+loopsie run --sleep 5m --name codexmonkey --timeout 30m -- \
+  codex exec "Review the latest changes and report the next useful improvement."
+```
 
-These protections cover command failures while Loopsie is running. Power loss,
-reboot, `SIGKILL`, and a killed supervisor require an external service manager to
-restart it. For that setup, run `loopsie run --fg ...` under launchd or systemd.
-Descendants that deliberately create another process group/session can escape
-group cleanup. OS resource limits still apply, and instances sharing a working
-directory can interfere through the files their commands edit.
+Set it. Forget it. Go touch grass, or your... nvm.
 
-## Options
+Use `claude -p`, `codex exec`, or your CLI's equivalent batch mode. Commands get closed stdin, so an interactive agent waiting for you to press Enter is going to have a bad time. Your agents keep their usual permissions and authentication.
+
+Each run starts a fresh command in the directory where you launched the loop, with your environment. Want to resume an agent session? Pass that CLI's resume options. Running several agents in the same repo is still several agents editing the same repo. Choose your chaos.
+
+## When shit goes sideways
+
+- **Command crashed?** Retry. Delays start at **1s**, double up to **60s**, and reset after a successful run. Missing executables and failed starts get retried too.
+- **Command stuck?** Each attempt gets **1 hour** by default. Change it with `--timeout 30m`, or use `--timeout 0` if you really do mean forever.
+- **Command won't leave?** Stop and timeout requests send TERM to its process group, then KILL after **5s**. Set `--grace` to change that upper bound. Once the command exits and its output closes, leftover group members get killed immediately. Cleanup happens before the next attempt.
+- **Command won't shut up?** Logs rotate while it runs. Two files, **5 MiB each**, by default. Your disk doesn't need the complete memoirs of `echo`.
+- **Two loops want the same name?** One wins. File locks prevent duplicate owners, and control sockets mean a stale PID can't get some unrelated process murdered.
+
+This keeps failed commands from taking the loop down. Reboots, power cuts, or killing Loopsie itself still need an external service manager to restart it. Use `--fg` under launchd or systemd for that. Processes that deliberately leave the command's process group can escape cleanup.
+
+## Aliases (for the truly lazy)
+
+Tired of typing the same command prefix every time? Same.
+
+```sh
+# Save it once
+loopsie alias set claude -- claude -p
+
+# Use it forever — everything after -- gets appended
+loopsie run --sleep 5m --alias claude -- "Review the latest changes"
+
+loopsie alias ls
+loopsie alias show claude
+loopsie alias rm claude
+```
+
+Aliases preserve argument boundaries. No shell magic. If you want pipes, redirects, or shell builtins, say so: `loopsie run --sleep 30s -- sh -c 'git status --short | head'`.
+
+## Managing your loops
+
+```sh
+loopsie ls                 # what's running? what died?
+loopsie logs codemonkey    # what did it do?
+loopsie logs -f codemonkey # what is it doing right now?
+loopsie kill codemonkey    # ok that's enough
+loopsie kill --all         # everybody out
+```
+
+`kill` acknowledges the stop request; `ls` shows `stopped` when cleanup finishes. Foreground loops also clean up on Ctrl-C, TERM, or HUP. Sleep and retry waits are interruptible. You don't have to sit through the rest of a five-minute nap.
+
+## Full CLI
 
 ```text
 loopsie run [OPTIONS] -- COMMAND [ARGS...]
 
-  -n, --name NAME          Unique name; generated if omitted
-  -e, --every DURATION     Minimum interval between invocation starts
+  -n, --name NAME          Name this loop (generated if omitted)
+  -e, --every DURATION     Minimum interval between starts
   -s, --sleep DURATION     Delay after completion (default: 0)
   -m, --max N              Stop after N attempts (default: 0 = forever)
-      --alias NAME         Prepend a saved command
-      --fg                 Run in foreground; output still goes to logs
-      --timeout DURATION   Invocation timeout (default: 1h; 0 disables)
-      --grace DURATION     Termination grace period (default: 5s)
-      --backoff DURATION   Initial failure retry delay (default: 1s)
+      --alias NAME         Use a saved alias as command prefix
+      --fg                 Stay in foreground; output still goes to logs
+      --timeout DURATION   Limit each attempt (default: 1h; 0 disables)
+      --grace DURATION     Time before force kill (default: 5s)
+      --backoff DURATION   Initial retry delay (default: 1s)
       --max-backoff DUR    Maximum retry delay (default: 1m)
       --log-bytes N        Bytes per log file (default: 5242880; minimum: 4096)
+
+loopsie ls
+loopsie logs [-f|--follow] NAME
+loopsie kill NAME | --all
+loopsie alias set NAME -- COMMAND [ARGS...]
+loopsie alias ls | show NAME | rm NAME
 ```
 
-Durations use whole numbers with `ms`, `s`, `m`, or `h`: `100ms`, `30s`, `1h30m`.
-A bare number means seconds. Durations are limited to 365 days.
-`--every` and `--sleep` are mutually exclusive. Invocations never overlap within
-one loop, and a slow invocation does not cause catch-up runs. After failure,
-the next invocation waits for both the schedule and retry delay.
+Durations: `100ms`, `30s`, `5m`, `2h`, `1h30m` — you get it. Whole numbers only; bare numbers mean seconds. Maximum duration: 365 days. Names: 1–48 ASCII letters, digits, underscores, or hyphens, with no leading hyphen.
 
-With no schedule, successful commands restart immediately. Use `--sleep` or
-`--every` when the command uses a paid API or needs a pause. `--max` counts all
-attempts, including failures, and never adds a delay after the last one.
-The command sees `LOOPSIE_NAME` and `LOOPSIE_ITERATION` (starting at 1).
+Pick `--every` or `--sleep`, not both. One loop never overlaps its own commands or tries to catch up on missed runs. After a failure, both the schedule and retry delay apply. Without a schedule, successful commands restart immediately. Maybe give the paid API a breather.
 
-Foreground finite loops return the final command's exit code: `124` for a timeout,
-`127` for a spawn failure, or `128 + signal` for a signal. A control-socket stop
-returns `0`; a direct signal to the supervisor returns `128 + signal`.
-Background `run` returns startup status; use `ls` and logs for command results.
-`kill` acknowledges the stop request; `ls` shows `stopped` after cleanup finishes.
+`--max` counts failed attempts too, and there's no pointless sleep after the last one. Commands receive `LOOPSIE_NAME` and `LOOPSIE_ITERATION`, starting at 1.
 
-## Aliases
+Foreground finite loops return the last command's exit code: `124` for timeout, `127` for failure to start, or `128 + signal` for signal termination. `loopsie kill` makes the supervisor exit `0`; directly signalling it returns `128 + signal`. Background startup returns once the loop is ready; check `ls` and logs for what happens next.
 
-```sh
-loopsie alias set reviewer -- codex exec
-loopsie run --name review --sleep 5m --alias reviewer -- "Review the latest changes."
-loopsie alias ls
-loopsie alias show reviewer
-loopsie alias rm reviewer
-```
+## Design philosophy
 
-Aliases store exact argument boundaries. They do not evaluate shell syntax.
-Names use 1–48 ASCII letters, digits, underscores, or hyphens, with no leading
-hyphen.
+- **Small and fast.** A stripped native binary. Rust 2024, one dependency (`libc`), one supervisor thread per loop. No async runtime, CLI framework, database, or interpretive dance.
+- **No central daemon.** Each loop is its own background process. Nothing running = nothing running. No built-in limit on instances; your OS gets the final say.
+- **Sleep means sleep.** Event-driven waits, bounded output buffers, and no growing pile of command output in memory.
+- **State in `~/.loopsie/`.** Locks, sockets, plain text status, and rotating logs. Set `LOOPSIE_DIR` to put them somewhere else, and use the same value for management commands.
 
-## State and logs
+Stopped status and logs stick around. `ls` shows the phase, PID, attempts, consecutive failures, and last exit. Reuse a stopped name by running it again. Leave live state files alone; the lock files stay on disk on purpose.
 
-State defaults to `~/.loopsie`. Set `LOOPSIE_DIR` to use another directory, and
-use the same value for management commands. Keep the directory path short enough
-for a Unix socket (on macOS, the full socket path must be under 104 bytes).
+`logs` prints both retained files. `logs -f` follows the current file across rotation until you interrupt it; a slow follower can miss output that's already rotated away. New directories use mode `0700`, files `0600`. Keep custom state paths short: macOS needs the full socket path under 104 bytes.
 
-Each name has a `.lock`, `.sock`, `.status`, `.log`, and optional `.log.1`.
-Stopped status and logs remain available. `ls` shows the current phase, supervisor
-PID, attempt count, consecutive failures, and last exit. An unlocked instance
-without a clean shutdown is shown as `stale`. Lock files intentionally remain on
-disk; never remove a live loop's files. To reuse a stopped name, just run it again.
+### Coming from 0.1.x?
 
-`logs NAME` prints both retained generations. `logs -f NAME` follows the current
-log across rotation until interrupted. A slow follower can miss generations
-already discarded by rotation. Logs include command output and lifecycle entries
-with Unix timestamps. New state directories use mode `0700`; new files use `0600`.
+Stop your old loops with the old executable first. The commands and log paths are familiar, but state and aliases have a new format. Recreate aliases with `loopsie alias set`. Remove old `.pid` files after stopping those loops so their names can be reused. Old `aliases.json` and `.meta.json` files are no longer read.
 
-Upgrading from 0.1.x: stop existing loops with the old executable first. The new
-version keeps the command vocabulary and log paths, but uses a new state and
-alias format. Recreate aliases with `loopsie alias set`. Old `.pid` files block
-reuse of that name until you remove them after stopping the old loop. Legacy
-`aliases.json` and `.meta.json` files are no longer read.
+## Contributing
 
-## Development
+Submit PRs so I can ignore them. Bonus points if you're a huge douche about it.
 
 ```sh
 cargo fmt --check
@@ -157,8 +158,10 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Integration tests execute real shell and Git commands in isolated temporary
-directories. CI runs them on macOS and Linux. See [validation](docs/validation.md)
-for the local agent CLI tests, measurements, and Rust design sources.
+The tests run real commands, break things on purpose, and check that the children get cleaned up. CI is configured for macOS and Linux. [Validation notes](docs/validation.md) cover the real Codex and Claude loops, 32 concurrent instances, and local speed and memory measurements.
 
-MIT licensed.
+## License
+
+[MIT](LICENSE) — do whatever you want.
+
+...Why the fuck are you still reading this.
