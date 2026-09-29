@@ -15,7 +15,7 @@ You've got a command. You want it to run over and over. Maybe with a delay, mayb
 
 That's it. That's the tool.
 
-Now it's Rust. One small binary for macOS and Linux, one dependency, and some actual seatbelts for when your command shits itself.
+One small binary for macOS and Linux, one dependency, and some actual seatbelts for when your command shits itself.
 
 ## Install
 
