@@ -19,7 +19,22 @@ One small binary for macOS and Linux, one dependency, and some actual seatbelts 
 
 ## Install
 
-Grab [Rust](https://rustup.rs/), then run this from the checkout:
+On macOS or Linux (Intel or Arm), install the latest release without Rust:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/geekforbrains/loopsie/main/install.sh | sh
+loopsie --version
+```
+
+The installer detects your machine, downloads the matching binary from the [latest GitHub release](https://github.com/geekforbrains/loopsie/releases/latest), verifies its SHA-256 checksum, and puts it in `~/.local/bin`. Add that directory to your `PATH` if needed. To install a specific release or choose another directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/geekforbrains/loopsie/main/install.sh | LOOPSIE_VERSION=v0.2.0 LOOPSIE_INSTALL_DIR="$HOME/bin" sh
+```
+
+You can also download the matching archive and `.sha256` file from [Releases](https://github.com/geekforbrains/loopsie/releases), verify it, and copy the binary into a directory on your `PATH`.
+
+To build from source instead, grab [Rust](https://rustup.rs/), then run this from the checkout:
 
 ```sh
 cargo install --path . --locked
@@ -187,10 +202,6 @@ Stopped status and logs stick around. `ls` shows the phase, PID, command attempt
 
 `logs` prints both retained files. `logs -f` follows the current file across rotation until you interrupt it; a slow follower can miss output that's already rotated away. New directories use mode `0700`, files `0600`. Keep custom state paths short: macOS needs the full socket path under 104 bytes.
 
-### Coming from 0.1.x?
-
-Stop your old loops with the old executable first. The commands and log paths are familiar, but state and aliases have a new format. Recreate aliases with `loopsie alias set`. Remove old `.pid` files after stopping those loops so their names can be reused. Old `aliases.json` and `.meta.json` files are no longer read.
-
 ## Contributing
 
 Submit PRs so I can ignore them. Bonus points if you're a huge douche about it.
@@ -203,6 +214,8 @@ cargo build --release --locked
 ```
 
 The tests run real commands, break things on purpose, and check that the children get cleaned up. CI is configured for macOS and Linux. [Validation notes](docs/validation.md) cover the real Codex and Claude loops, 32 concurrent instances, and local speed and memory measurements.
+
+For a release, update the version in `Cargo.toml`, commit it, then push a matching `v` tag. The release workflow builds and checks macOS and Linux archives for Intel and Arm, then publishes them on GitHub. The installer always follows the latest published release unless you set `LOOPSIE_VERSION`.
 
 ## License
 
